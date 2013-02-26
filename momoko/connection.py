@@ -11,19 +11,18 @@ MIT, see LICENSE for more details.
 
 from functools import partial
 from collections import deque
-from contextlib import contextmanager
 
 import psycopg2
 from psycopg2.extras import register_hstore
 from psycopg2.extensions import (connection as base_connection, cursor as base_cursor,
     POLL_OK, POLL_READ, POLL_WRITE, POLL_ERROR, TRANSACTION_STATUS_IDLE)
 
-from tornado import gen
-from tornado.ioloop import IOLoop, PeriodicCallback
+from tornado.ioloop import IOLoop
 
 from .utils import log
 from .exceptions import PoolError
 
+import time
 
 # The dummy callback is used to keep the asynchronous cursor alive in case no
 # callback has been specified. This will prevent the cursor from being garbage
@@ -78,6 +77,9 @@ class Pool:
 
         self._ioloop = ioloop or IOLoop.instance()
         self._pool = []
+        self._warnings = 0
+        self._last_warning = 0
+        self._interval = 600 # 10 minute interval
 
         # Create connections
         def after_pool_creation(n, connection):
@@ -106,6 +108,16 @@ class Pool:
             if not connection.busy():
                 return connection
 
+    def _queue_warning(self):
+        tick = time.time()
+        self._warnings += 1
+        if self._last_warning == 0:
+            self._last_warning = tick
+        elif tick-self._last_warning > self._interval:
+            log.warning('No connection available, %d operations queued in last %d seconds. Make connection pool bigger?'%(self._warnings,tick-self._last_warning))
+            self._last_warning = tick
+            self._warnings = 0
+
     def transaction(self,
         statements,
         cursor_factory=None,
@@ -119,7 +131,7 @@ class Pool:
         """
         connection = self._get_connection()
         if not connection:
-            log.warning('No connection available, operation queued. Make connection pool bigger?')
+            self._queue_warning()
             return self._ioloop.add_callback(partial(self.transaction,
                 statements, cursor_factory, callback))
 
@@ -139,7 +151,7 @@ class Pool:
         """
         connection = self._get_connection()
         if not connection:
-            log.warning('No connection available, operation queued. Make connection pool bigger?')
+            self._queue_warning()
             return self._ioloop.add_callback(partial(self.execute,
                 operation, parameters, cursor_factory, callback))
 
@@ -159,7 +171,7 @@ class Pool:
         """
         connection = self._get_connection()
         if not connection:
-            log.warning('No connection available, operation queued. Make connection pool bigger?')
+            self._queue_warning()
             return self._ioloop.add_callback(partial(self.callproc,
                 procname, parameters, cursor_factory, callback))
 
@@ -258,7 +270,7 @@ class Connection:
             elif state == POLL_WRITE:
                 self.ioloop.update_handler(self.fileno, IOLoop.WRITE)
             else:
-                raise OperationalError('poll() returned {0}'.format(state))
+                raise psycopg2.OperationalError('poll() returned {0}'.format(state))
 
     def execute(self,
         operation,
@@ -309,7 +321,7 @@ class Connection:
         The procedure may also provide a result set as output. This must then be
         made available through the standard `fetch*()`_ methods.
 
-        :param string operation: The name of the database procedure.
+        :param string procname: The name of the database procedure.
         :param tuple/list parameters:
             A list or tuple with query parameters. See `Passing parameters to SQL queries`_
             for more information. Defaults to an empty tuple.
